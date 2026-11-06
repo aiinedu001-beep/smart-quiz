@@ -1356,6 +1356,34 @@ function StatisticsView({ answerLogs, questions, subjects }) {
   );
 }
 
+// CSV 解析器（支援引號、欄位內逗號與換行、BOM）
+function parseCSV(text) {
+  if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
+  const rows = [];
+  let row = [], field = '', inQuotes = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (inQuotes) {
+      if (ch === '"') {
+        if (text[i + 1] === '"') { field += '"'; i++; }
+        else inQuotes = false;
+      } else field += ch;
+    } else if (ch === '"') inQuotes = true;
+    else if (ch === ',') { row.push(field); field = ''; }
+    else if (ch === '\n' || ch === '\r') {
+      if (ch === '\r' && text[i + 1] === '\n') i++;
+      row.push(field); field = '';
+      if (row.some(c => c.trim() !== '')) rows.push(row);
+      row = [];
+    } else field += ch;
+  }
+  if (field !== '' || row.length) {
+    row.push(field);
+    if (row.some(c => c.trim() !== '')) rows.push(row);
+  }
+  return rows;
+}
+
 // ==========================================
 // 6. 題庫與分類後台管理頁 (Admin View)
 // ==========================================
@@ -1396,46 +1424,104 @@ function AdminView({ categories, setCategories, subjects, setSubjects, chapters,
     }
   };
 
-  // CSV Import Simulation Handler
+   // CSV 匯入（支援「馬祖戰地小學堂」格式）
   const handleCSVImport = (e) => {
-    const file = e.target.files[0];
+    const input = e.target;
+    const file = input.files[0];
     if (!file) return;
 
     const reader = new FileReader();
     reader.onload = (evt) => {
       try {
-        const text = evt.target.result;
-        const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
-        // Header line expected: title,type,difficulty,opt0,opt1,opt2,opt3,correct,explanation
+        const rows = parseCSV(evt.target.result);
+        const header = rows[0].map(h => h.trim());
+        const idx = (n) => header.indexOf(n);
+        const get = (r, n) => (idx(n) >= 0 ? (r[idx(n)] || '').trim() : '');
+
+        if (idx('question') === -1 || idx('correct_answer') === -1) {
+          alert('找不到 question / correct_answer 欄位，請確認 CSV 標頭。');
+          return;
+        }
+
+        const CAT_ID = 'cat-matsu';
+        const SUB_ID = 'sub-matsu';
+        const diffMap = { '易': 'easy', '中': 'medium', '難': 'hard' };
+        const letters = ['A', 'B', 'C', 'D'];
+        const dataRows = rows.slice(1);
+        const unitNames = [...new Set(dataRows.map(r => get(r, 'unit')).filter(Boolean))];
+        const existingIds = new Set(questions.map(q => q.id));
+
         const newQs = [];
-        for (let i = 1; i < lines.length; i++) {
-          const cols = lines[i].split(',');
-          if (cols.length >= 8) {
-            newQs.push({
-              id: 'q-import-' + Date.now() + '-' + i,
-              categoryId: categories[0]?.id || '',
-              subjectId: subjects[0]?.id || '',
-              chapterId: chapters[0]?.id || '',
-              title: cols[0],
-              type: cols[1] || 'single',
-              difficulty: cols[2] || 'medium',
-              options: [cols[3], cols[4], cols[5], cols[6]],
-              correctAnswer: [parseInt(cols[7]) || 0],
-              explanation: cols[8] || '匯入題庫解析'
-            });
+        let skippedDup = 0, skippedBad = 0, skippedExisting = 0;
+
+        dataRows.forEach((r, i) => {
+          if (get(r, 'duplicate_of')) { skippedDup++; return; }
+
+          const id = get(r, 'question_id') || ('q-import-' + Date.now() + '-' + i);
+          if (existingIds.has(id)) { skippedExisting++; return; }
+
+          const title = get(r, 'question');
+          const typeRaw = get(r, 'question_type');
+          const ansRaw = get(r, 'correct_answer');
+          let type, options, correctAnswer;
+
+          if (typeRaw.includes('是非')) {
+            type = 'boolean';
+            options = ['對 (True)', '錯 (False)'];
+            if (ansRaw.includes('對')) correctAnswer = [0];
+            else if (ansRaw.includes('錯')) correctAnswer = [1];
+            else { skippedBad++; return; }
+          } else {
+            options = letters.map(l => get(r, 'option_' + l));
+            while (options.length && !options[options.length - 1]) options.pop();
+            const picked = (ansRaw.toUpperCase().match(/[A-D]/g) || []).map(l => letters.indexOf(l));
+            if (!title || options.length < 2 || picked.length === 0 || picked.some(p => p >= options.length)) {
+              skippedBad++; return;
+            }
+            correctAnswer = [...new Set(picked)].sort();
+            type = correctAnswer.length > 1 ? 'multiple' : 'single';
           }
+
+          const ref = get(r, 'source_reference');
+          newQs.push({
+            id,
+            categoryId: CAT_ID,
+            subjectId: SUB_ID,
+            chapterId: 'chap-matsu-' + unitNames.indexOf(get(r, 'unit')),
+            type,
+            difficulty: diffMap[get(r, 'difficulty')] || 'medium',
+            title,
+            options,
+            correctAnswer,
+            explanation: (get(r, 'explanation') || '（尚無解析）') + (ref ? ' 【出處】' + ref : '')
+          });
+        });
+
+        if (newQs.length === 0) {
+          alert('沒有可匯入的新題目，請確認 CSV 格式或是否已匯入過。');
+          return;
         }
-        if (newQs.length > 0) {
-          setQuestions(prev => [...newQs, ...prev]);
-          alert(`成功匯入 ${newQs.length} 道題目！`);
-        } else {
-          alert('匯入失敗，請確認 CSV 格式正確！');
-        }
+
+        // 自動建立類別、科目、章節（單元）
+        setCategories(prev => prev.some(c => c.id === CAT_ID) ? prev : [...prev, { id: CAT_ID, name: '馬祖戰地小學堂' }]);
+        setSubjects(prev => prev.some(s => s.id === SUB_ID) ? prev : [...prev, { id: SUB_ID, categoryId: CAT_ID, name: '馬祖戰地知識' }]);
+        setChapters(prev => {
+          const add = unitNames
+            .map((u, k) => ({ id: 'chap-matsu-' + k, subjectId: SUB_ID, name: u }))
+            .filter(c => !prev.some(p => p.id === c.id));
+          return [...prev, ...add];
+        });
+        setQuestions(prev => [...newQs, ...prev]);
+
+        alert(`成功匯入 ${newQs.length} 題！\n略過疑似重複：${skippedDup} 題\n略過格式錯誤：${skippedBad} 題\n略過已存在：${skippedExisting} 題`);
       } catch (err) {
+        console.error(err);
         alert('解析 CSV 檔案時發生錯誤。');
+      } finally {
+        input.value = '';
       }
     };
-    reader.readAsText(file);
+    reader.readAsText(file, 'UTF-8');
   };
 
   return (
